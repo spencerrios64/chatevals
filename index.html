@@ -1,0 +1,119 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>chatevals</title><script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script><style>:root{--bg:#0f1117;--card:#181b24;--bd:#2a2f3d;--tx:#e6e8ee;--mut:#8b92a6;--ac:#7c9cff}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--tx)}
+main{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{margin:.2em 0}p.sub{color:var(--mut);margin-top:0}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin:14px 0}
+.drop{border:2px dashed var(--bd);border-radius:12px;padding:28px;text-align:center;color:var(--mut);cursor:pointer}
+.drop.over,.drop:hover{border-color:var(--ac);color:var(--tx)}
+button,select,input,textarea{font:inherit;color:var(--tx);background:#10131b;border:1px solid var(--bd);border-radius:8px;padding:8px 12px}
+button{cursor:pointer;background:var(--ac);color:#0b0e16;border:0;font-weight:600}button.sec{background:#222736;color:var(--tx)}
+button:disabled{opacity:.4;cursor:default}input[type=text],input:not([type]),textarea{width:100%}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.mut{color:var(--mut)}.pill{background:#222736;border-radius:99px;padding:2px 10px;font-size:12px;color:var(--mut)}
+.hit{border-top:1px solid var(--bd);padding:10px 0}.hit:first-child{border:0}mark{background:#5a4b00;color:#ffe98a;border-radius:3px}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:left}
+.note{font-size:13px;color:var(--mut)}canvas{width:100%;background:#0b0d13;border-radius:12px;border:1px solid var(--bd)}
+</style></head><body><main><h1>chatevals</h1><p class="sub">Which AI is actually best for what? Log which answer you preferred, then see win rates per AI and topic, plus a suggested fallback order for chatrelay. Stored only in your browser.</p>
+<div class="card"><h3 style="margin-top:0">Log a comparison</h3>
+<div class="row"><input id="topic" placeholder="Topic (coding, writing, math, advice…)" list="topics" style="flex:1"><datalist id="topics"></datalist></div>
+<div class="row" style="margin-top:8px"><input id="ais" placeholder="AIs compared, comma separated (Claude, ChatGPT, Gemini)" style="flex:1"><input id="win" placeholder="Winner" style="max-width:200px"></div>
+<div class="row" style="margin-top:8px"><button id="add">Add result</button><button class="sec" id="exp">Export CSV</button><button class="sec" id="imp">Import CSV</button><button class="sec" id="clr">Clear all</button></div></div>
+<div class="card"><div class="row"><select id="f"><option value="">All topics</option></select></div><canvas id="cv" height="320"></canvas>
+<h3>Suggested chatrelay fallback order</h3><div id="order" class="note">Log a few results first.</div></div>
+<div class="card"><table id="tbl"></table></div>
+<script>
+/* shared core: parse AI chat exports in the browser (nothing is uploaded) */
+const Chats = (() => {
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  function textOfClaude(m){
+    if (m.text) return m.text;
+    if (Array.isArray(m.content)) return m.content.map(c => c.text || '').join('\n');
+    return '';
+  }
+  function parseData(data, name){
+    const out = [];
+    if (!Array.isArray(data)) data = data && data.conversations ? data.conversations : [data];
+    for (const c of data){
+      if (!c) continue;
+      if (c.chat_messages){ // Claude
+        out.push({id:c.uuid||c.id||name+out.length, title:c.name||'(untitled)', ai:'Claude',
+          created:c.created_at||'', messages:c.chat_messages.map(m=>({role:m.sender==='human'?'user':'assistant', text:textOfClaude(m)})).filter(m=>m.text)});
+      } else if (c.mapping){ // ChatGPT
+        const msgs = Object.values(c.mapping).map(n=>n.message).filter(m=>m&&m.content&&m.author&&m.author.role!=='system'&&m.author.role!=='tool')
+          .sort((a,b)=>(a.create_time||0)-(b.create_time||0))
+          .map(m=>({role:m.author.role, text:(m.content.parts||[]).filter(p=>typeof p==='string').join('\n')})).filter(m=>m.text.trim());
+        out.push({id:c.conversation_id||c.id||name+out.length, title:c.title||'(untitled)', ai:'ChatGPT',
+          created:c.create_time?new Date(c.create_time*1000).toISOString():'', messages:msgs});
+      } else if (Array.isArray(c.messages)){ // generic
+        out.push({id:c.id||name+out.length, title:c.title||c.name||'(untitled)', ai:c.ai||c.source||'Other',
+          created:c.created||c.created_at||'', messages:c.messages.map(m=>({role:m.role||(m.sender==='human'?'user':'assistant'), text:m.text||m.content||''})).filter(m=>m.text)});
+      }
+    }
+    return out;
+  }
+  async function loadFiles(fileList){
+    let all = [];
+    for (const f of fileList){
+      if (/\.zip$/i.test(f.name) && window.JSZip){
+        const z = await JSZip.loadAsync(f);
+        for (const [n, e] of Object.entries(z.files)){
+          if (!e.dir && /\.json$/i.test(n) && /conversation|chat/i.test(n)){
+            try { all = all.concat(parseData(JSON.parse(await e.async('string')), n)); } catch(_){}
+          }
+        }
+      } else if (/\.jsonl$/i.test(f.name)){
+        const lines = (await f.text()).split('\n').filter(Boolean);
+        try { all = all.concat(parseData(lines.map(l=>JSON.parse(l)), f.name)); } catch(_){}
+      } else {
+        try { all = all.concat(parseData(JSON.parse(await f.text()), f.name)); } catch(_){}
+      }
+    }
+    return all;
+  }
+  const fullText = c => c.messages.map(m=>m.text).join('\n');
+  const STOP = new Set('the a an and or but if of to in on at for with from by is are was were be been it this that these those i you he she we they me my your our their as not no so do does did can could would should will just have has had about into than then there what which who how when why also more some any all one'.split(' '));
+  const tokens = s => (s.toLowerCase().match(/[a-z0-9À-ɏͰ-Ͽ]{2,}/g)||[]).filter(w=>!STOP.has(w));
+  function download(name, content, type){
+    const b = content instanceof Blob ? content : new Blob([content], {type: type||'text/plain'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+  }
+  const PATTERNS = [
+    [/sk-[A-Za-z0-9_\-]{20,}/g,'[API_KEY]'],[/AIza[0-9A-Za-z_\-]{30,}/g,'[API_KEY]'],[/gh[pousr]_[A-Za-z0-9]{30,}/g,'[GITHUB_TOKEN]'],
+    [/AKIA[0-9A-Z]{16}/g,'[AWS_KEY]'],[/[\w.+-]+@[\w-]+\.[\w.-]+/g,'[EMAIL]'],[/\bhttps?:\/\/[^\s)]+/g,m=>m],
+    [/(?<!\d)\+?\d[\d\s().-]{8,}\d(?!\d)/g,'[PHONE]'],[/\b(?:\d[ -]*?){13,16}\b/g,'[CARD]']
+  ];
+  const scrub = s => PATTERNS.reduce((t,[re,r])=>t.replace(re,r), s);
+  return {esc, parseData, loadFiles, fullText, tokens, download, scrub};
+})();
+const $ = s => document.querySelector(s);
+function dropzone(el, cb){
+  el.addEventListener('dragover', e=>{e.preventDefault(); el.classList.add('over');});
+  el.addEventListener('dragleave', ()=>el.classList.remove('over'));
+  el.addEventListener('drop', e=>{e.preventDefault(); el.classList.remove('over'); cb(e.dataTransfer.files);});
+  const inp = document.createElement('input'); inp.type='file'; inp.multiple=true; inp.hidden=true; inp.accept='.json,.jsonl,.zip';
+  el.after(inp); el.addEventListener('click', ()=>inp.click()); inp.addEventListener('change', ()=>cb(inp.files));
+}
+
+
+let rows=JSON.parse(localStorage.getItem('chatevals')||'[]');
+const save=()=>{localStorage.setItem('chatevals',JSON.stringify(rows));draw()};
+$('#add').onclick=()=>{const ais=$('#ais').value.split(',').map(s=>s.trim()).filter(Boolean),w=$('#win').value.trim(),t=$('#topic').value.trim().toLowerCase()||'general';
+  if(ais.length<2||!w){alert('Enter at least two AIs and a winner');return}
+  if(!ais.some(a=>a.toLowerCase()===w.toLowerCase())){alert('Winner must be one of the AIs');return}
+  rows.push({t,ais,w,d:new Date().toISOString().slice(0,10)});save()};
+function stats(f){const s={};rows.filter(r=>!f||r.t===f).forEach(r=>r.ais.forEach(a=>{const k=a.toLowerCase();s[k]=s[k]||{n:a,w:0,g:0};s[k].g++;if(a.toLowerCase()===r.w.toLowerCase())s[k].w++}));return Object.values(s).sort((a,b)=>b.w/b.g-a.w/a.g)}
+function draw(){
+  const topics=[...new Set(rows.map(r=>r.t))];const cur=$('#f').value;
+  $('#f').innerHTML='<option value="">All topics</option>'+topics.map(t=>`<option ${t===cur?'selected':''}>${t}</option>`).join('');
+  $('#topics').innerHTML=topics.map(t=>`<option>${t}</option>`).join('');
+  const s=stats($('#f').value),c=$('#cv'),x=c.getContext('2d');c.width=c.clientWidth*2;c.height=640;x.scale(2,2);x.clearRect(0,0,c.width,c.height);
+  const W=c.clientWidth;x.font='13px system-ui';
+  s.forEach((a,i)=>{const y=20+i*40,p=a.g?a.w/a.g:0;x.fillStyle='#e6e8ee';x.fillText(a.n,10,y+14);x.fillStyle='#222736';x.fillRect(110,y,W-200,22);x.fillStyle='#7c9cff';x.fillRect(110,y,(W-200)*p,22);x.fillStyle='#e6e8ee';x.fillText(Math.round(p*100)+'% ('+a.w+'/'+a.g+')',W-80,y+15)});
+  $('#order').innerHTML=s.length?s.map((a,i)=>`${i+1}. <b>${Chats.esc(a.n)}</b>`).join(' → ')+' <span class="note">(first = try first; falls back down the list)</span>':'Log a few results first.';
+  $('#tbl').innerHTML='<tr><th>Date</th><th>Topic</th><th>Compared</th><th>Winner</th><th></th></tr>'+rows.map((r,i)=>`<tr><td>${r.d}</td><td>${Chats.esc(r.t)}</td><td>${Chats.esc(r.ais.join(', '))}</td><td>${Chats.esc(r.w)}</td><td><button class="sec" onclick="rows.splice(${i},1);save()">✕</button></td></tr>`).join('');
+}
+$('#f').onchange=draw;$('#clr').onclick=()=>{if(confirm('Delete all results?')){rows=[];save()}};
+$('#exp').onclick=()=>Chats.download('chatevals.csv','date,topic,compared,winner\n'+rows.map(r=>[r.d,r.t,r.ais.join('|'),r.w].map(v=>`"${v}"`).join(',')).join('\n'),'text/csv');
+$('#imp').onclick=()=>{const i=document.createElement('input');i.type='file';i.accept='.csv';i.onchange=async()=>{(await i.files[0].text()).split('\n').slice(1).forEach(l=>{const p=[...l.matchAll(/"([^"]*)"/g)].map(m=>m[1]);if(p.length>=4)rows.push({d:p[0],t:p[1],ais:p[2].split('|'),w:p[3]})});save()};i.click()};
+draw();
+</script>
+</main></body></html>
